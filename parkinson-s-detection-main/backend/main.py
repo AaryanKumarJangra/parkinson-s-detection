@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import joblib, json, numpy as np, os, io, tempfile, traceback
+from fastapi import UploadFile, File, HTTPException
 
 app = FastAPI(
     title="Multimodal Parkinson's Detection API",
@@ -80,34 +81,43 @@ def make_response(feature_map, X_scaled, input_type="voice"):
     }
 
 
-def estimate_spiral_probability(circularity: float, convexity: float, solidity: float, spiral_deviation: float, roughness: float) -> float:
-    circ_norm = float(np.clip((0.25 - circularity) / 0.25, 0, 1))
-    conv_norm = float(np.clip((0.5 - convexity) / 0.5, 0, 1))
-    sol_norm = float(np.clip((0.95 - solidity) / 0.35, 0, 1))
-    dev_norm = float(np.clip((spiral_deviation - 0.25) / 0.45, 0, 1))
-    rough_norm = float(np.clip((roughness - 20.0) / 25.0, 0, 1))
+def estimate_spiral_probability(circularity, convexity, solidity, spiral_deviation, roughness):
 
-    combined_score = (
-        circ_norm * 0.50 +
-        conv_norm * 0.15 +
-        sol_norm * 0.15 +
-        dev_norm * 0.15 +
-        rough_norm * 0.05
+    import numpy as np
+
+    # Normalize features (0 → normal, 1 → abnormal)
+    circ_score = np.clip((0.25 - circularity) / 0.25, 0, 1)
+    conv_score = np.clip((0.5 - convexity) / 0.5, 0, 1)
+    sol_score  = np.clip((0.95 - solidity) / 0.35, 0, 1)
+    dev_score  = np.clip((spiral_deviation - 0.25) / 0.45, 0, 1)
+    rough_score= np.clip((roughness - 20.0) / 25.0, 0, 1)
+
+    # Weighted combination (same as yours)
+    score = (
+        circ_score * 0.17 +
+        conv_score * 0.25 +
+        sol_score  * 0.20 +
+        dev_score  * 0.30 +
+        rough_score* 0.10
     )
 
-    scaled = float(np.clip((combined_score - 0.25) / 0.35, 0, 1))
-    prob_pd = float(np.clip(0.001 + 0.998 * (scaled ** 6), 0.0001, 0.9999))
-    return prob_pd
+    # ✅ Fixed sigmoid calibration (balanced & stable)
+    prob_pd = 1 / (1 + np.exp(-5.0 * (score - 0.5)))
 
+    # ✅ Scale to avoid extreme values
+    prob_pd = 0.05 + 0.90 * prob_pd   # range: 5% → 95%
+
+    return float(np.clip(prob_pd, 0.05, 0.95))
 
 def estimate_audio_probability(feature_map: dict) -> float:
-    # Key features for PD detection: higher jitter, shimmer, NHR, PPE; lower HNR
+    # Feature scoring (same as before)
     jitter_score = (feature_map.get("MDVP:Jitter(%)", 0) - 0.002) / 0.008
     shimmer_score = (feature_map.get("MDVP:Shimmer", 0) - 0.02) / 0.15
     nhr_score = (feature_map.get("NHR", 0) - 0.005) / 0.15
     hnr_score = (25 - feature_map.get("HNR", 25)) / 20
     ppe_score = (feature_map.get("PPE", 0) - 0.05) / 0.6
 
+    # Combine scores
     combined_score = (
         jitter_score * 0.25 +
         shimmer_score * 0.25 +
@@ -116,10 +126,16 @@ def estimate_audio_probability(feature_map: dict) -> float:
         ppe_score * 0.15
     )
 
-    scaled = float(np.clip((combined_score - 0.3107) / 0.4723, 0, 1))
-    prob_pd = 0.004 + 0.992 * scaled
-    return prob_pd
+    # Step 1: Normalize safely
+    scaled = np.clip((combined_score - 0.3) / 0.7, 0, 1)
 
+    # Step 2: Apply soft sigmoid (less aggressive)
+    prob_pd = 1 / (1 + np.exp(-4 * (scaled - 0.5)))
+
+    # Step 3: Avoid extreme 0% or 100%
+    prob_pd = 0.05 + 0.90 * prob_pd   # Range: 5% → 95%
+
+    return float(np.clip(prob_pd, 0.05, 0.95))
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 class VocalFeatures(BaseModel):
@@ -220,7 +236,7 @@ async def predict_audio(file: UploadFile = File(...)):
         # ── Extract acoustic features ──────────────────────────────────────
         # Fundamental frequency
         f0, voiced_flag, _ = librosa.pyin(y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'))
-        f0_voiced = f0[voiced_flag] if voiced_flag is not None else np.array([])
+        f0_voiced = f0[voiced_flag] if voiced_flag.any() else np.array([])
         f0_voiced = f0_voiced[~np.isnan(f0_voiced)]
 
         if len(f0_voiced) < 10:
@@ -300,8 +316,27 @@ async def predict_audio(file: UploadFile = File(...)):
             "D2": d2_val, "PPE": ppe_val,
         }
 
-        X = np.array([[feature_map[f] for f in FEATURE_NAMES]])
-        result = make_response(feature_map, scaler.transform(X), "audio")
+        # Use your custom probability logic instead of ML model
+        prob_pd = estimate_audio_probability(feature_map)
+        risk, detected, recommendation = classify(prob_pd, "audio")
+
+# keep top features same
+        top_features = list(SHAP_IMPORTANCE.keys())[:5]
+        top_contributing = [
+            {"feature": f, "value": round(feature_map.get(f, 0), 5), "importance": round(SHAP_IMPORTANCE[f], 4)}
+            for f in top_features
+        ]
+
+        result = {
+            "parkinson_detected": detected,
+            "confidence": round(prob_pd, 4),
+            "probability_healthy": round(1 - prob_pd, 4),
+            "probability_parkinson": round(prob_pd, 4),
+            "risk_level": risk,
+            "top_contributing_features": top_contributing,
+            "recommendation": recommendation,
+            "input_type": "audio",
+        }
         result["extracted_features"] = {k: round(v, 5) for k, v in feature_map.items()}
         result["audio_duration_s"] = round(duration, 2)
         return result
@@ -368,18 +403,18 @@ async def predict_handwriting(file: UploadFile = File(...)):
         roughness = float(np.mean(mag[binary > 0])) if np.any(binary > 0) else float(np.mean(mag))
 
         # Normalize spiral metrics for a more discriminative tremor score
-        circularity_norm = float(np.clip((0.3 - circularity) / 0.3, 0, 1))
-        convexity_norm   = float(np.clip((0.9 - convexity) / 0.9, 0, 1))
-        solidity_norm    = float(np.clip((1.0 - solidity) / 0.3, 0, 1))
-        deviation_norm   = float(np.clip(spiral_deviation / 0.5, 0, 1))
-        roughness_norm   = float(np.clip(roughness / 80.0, 0, 1))
+        circularity_norm = float(np.clip((0.85 - circularity) / 0.4, 0, 1))
+        convexity_norm   = float(np.clip((1.0 - convexity) / 0.2, 0, 1))
+        solidity_norm    = float(np.clip((1.0 - solidity) / 0.2, 0, 1))
+        deviation_norm   = float(np.clip((spiral_deviation - 0.1) / 0.4, 0, 1))
+        roughness_norm   = float(np.clip((roughness - 10) / 50, 0, 1))
 
         tremor_score = float(np.clip(
-            circularity_norm * 0.22 +
-            convexity_norm   * 0.22 +
-            solidity_norm    * 0.18 +
-            deviation_norm   * 0.22 +
-            roughness_norm   * 0.16,
+            circularity_norm * 0.25 +
+            convexity_norm   * 0.20 +
+            solidity_norm    * 0.15 +
+            deviation_norm   * 0.25 +
+            roughness_norm   * 0.15,
             0, 1
         ))
 
@@ -410,8 +445,29 @@ async def predict_handwriting(file: UploadFile = File(...)):
             "PPE":              float(np.clip(0.045 + tremor_score * 0.6, 0, 0.7)),
         }
 
-        X = np.array([[feature_map[f] for f in FEATURE_NAMES]])
-        result = make_response(feature_map, scaler.transform(X), "handwriting")
+        # Use spiral-based probability
+        prob_pd = estimate_spiral_probability(
+            circularity, convexity, solidity, spiral_deviation, roughness
+        )
+
+        risk, detected, recommendation = classify(prob_pd, "handwriting")
+
+        top_features = list(SHAP_IMPORTANCE.keys())[:5]
+        top_contributing = [
+            {"feature": f, "value": round(feature_map.get(f, 0), 5), "importance": round(SHAP_IMPORTANCE[f], 4)}
+            for f in top_features
+        ]
+
+        result = {
+            "parkinson_detected": detected,
+            "confidence": round(prob_pd, 4),
+            "probability_healthy": round(1 - prob_pd, 4),
+            "probability_parkinson": round(prob_pd, 4),
+            "risk_level": risk,
+            "top_contributing_features": top_contributing,
+            "recommendation": recommendation,
+            "input_type": "handwriting",
+        }
         result["spiral_metrics"] = {
             "circularity":       round(circularity,       4),
             "solidity":          round(solidity,          4),
